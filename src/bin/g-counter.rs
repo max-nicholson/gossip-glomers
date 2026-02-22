@@ -1,28 +1,13 @@
-use std::sync::LazyLock;
-use std::{collections::HashMap, io::stderr};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context;
-use gossip_glomers::{
-    ErrorBody, ErrorMessageType, InitBody, Message, MessageID, Node, Output, Service, kv,
-};
-use regex::Regex;
+use gossip_glomers::{InitBody, Message, MessageID, Node, Output};
 use serde::{Deserialize, Serialize};
 
-const GLOBAL_COUNTER_KEY: &str = "counter";
-
-#[derive(Debug)]
-struct ReadRequest {
-    src: String,
-    msg_id: Option<MessageID>,
-    last_read: u64,
-}
-
-#[derive(Debug)]
-struct WriteRequest {
-    src: String,
-    msg_id: Option<MessageID>,
-    delta: u64,
-}
+const BROADCAST_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 struct AddBody {
@@ -32,6 +17,11 @@ struct AddBody {
 #[derive(Debug, Serialize, PartialEq)]
 struct ReadOkBody {
     value: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+struct BroadcastBody {
+    values: HashMap<String, u64>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -46,7 +36,10 @@ enum ResponseType {
 enum MessageType {
     Add(AddBody),
     Read,
+    Broadcast(BroadcastBody),
 }
+
+type MessageBody = gossip_glomers::MessageBody<MessageType>;
 
 type ResponseBody = gossip_glomers::ResponseBody<ResponseType>;
 
@@ -55,10 +48,8 @@ type Response = gossip_glomers::Response<ResponseType>;
 struct GrowOnlyCounterNode {
     msg_id: MessageID,
     node_id: String,
-    reads: HashMap<MessageID, ReadRequest>,
-    writes: HashMap<MessageID, WriteRequest>,
-    last_read: u64,
-    kv: kv::Sequential,
+    counters: HashMap<String, u64>,
+    last_broadcast: Instant,
 }
 
 impl Node<MessageType> for GrowOnlyCounterNode {
@@ -66,127 +57,13 @@ impl Node<MessageType> for GrowOnlyCounterNode {
         Self {
             msg_id: 1,
             node_id: message.node_id.clone(),
-            kv: kv::Sequential::new(message.node_id.clone()),
-            last_read: 0,
-            reads: HashMap::new(),
-            writes: HashMap::new(),
-        }
-    }
-
-    fn on_error(
-        &mut self,
-        message: Message<ErrorMessageType>,
-        output: &mut Output,
-    ) -> anyhow::Result<()> {
-        let ErrorMessageType::Error(body) = message.body.kind;
-
-        if message.src != "seq-kv" {
-            return Ok(());
-        };
-
-        if body.code == 22
-            && let Some(msg_id) = body.in_reply_to
-        {
-            static RE: LazyLock<Regex> =
-                LazyLock::new(|| Regex::new(r"current value (\d+) is not \d+").unwrap());
-
-            if let Some(captures) = RE.captures(&body.text)
-                && let Some(last_read) = captures
-                    .get(1)
-                    .and_then(|m| str::parse::<u64>(m.as_str()).ok())
-            {
-                self.last_read = last_read
-            }
-
-            if let Some(write_request) = self.writes.remove(&msg_id) {
-                let mut request = self.kv.compare_and_swap::<u64>(
-                    GLOBAL_COUNTER_KEY,
-                    self.last_read,
-                    self.last_read + write_request.delta,
-                    self.last_read == 0,
-                );
-
-                request.body.msg_id = Some(self.msg_id);
-
-                self.writes.insert(self.msg_id, write_request);
-
-                request
-                    .serialize(output)
-                    .context("serializing compare_and_swap request")?;
-
-                self.msg_id += 1;
-            } else if let Some(mut read_request) = self.reads.remove(&msg_id) {
-                let mut request = self.kv.compare_and_swap::<u64>(
-                    GLOBAL_COUNTER_KEY,
-                    self.last_read,
-                    self.last_read,
-                    self.last_read == 0,
-                );
-
-                request.body.msg_id = Some(self.msg_id);
-
-                read_request.last_read = self.last_read;
-
-                self.reads.insert(self.msg_id, read_request);
-
-                request
-                    .serialize(output)
-                    .context("serializing compare_and_swap request")?;
-
-                self.msg_id += 1;
-            };
-        }
-
-        Ok(())
-    }
-
-    fn on_service(&mut self, service: Service, output: &mut Output) -> anyhow::Result<()> {
-        match service {
-            Service::KeyValue(message) => match message.body.kind {
-                kv::ResponseType::CompareAndSwapOk => {
-                    if let Some(msg_id) = message.body.in_reply_to {
-                        if let Some(request) = self.writes.get(&msg_id) {
-                            let reply = Response {
-                                src: self.node_id.clone(),
-                                dst: request.src.clone(),
-                                body: ResponseBody {
-                                    kind: ResponseType::AddOk,
-                                    msg_id: Some(self.msg_id),
-                                    in_reply_to: request.msg_id,
-                                },
-                            };
-                            reply
-                                .serialize(output)
-                                .context("serializing add_ok response")?;
-                            self.msg_id += 1;
-
-                            self.writes.remove(&msg_id);
-                        } else if let Some(request) = self.reads.get(&msg_id) {
-                            let reply = Response {
-                                src: self.node_id.clone(),
-                                dst: request.src.clone(),
-                                body: ResponseBody {
-                                    kind: ResponseType::ReadOk(ReadOkBody {
-                                        value: request.last_read,
-                                    }),
-                                    msg_id: Some(self.msg_id),
-                                    in_reply_to: request.msg_id,
-                                },
-                            };
-
-                            reply
-                                .serialize(output)
-                                .context("serializing read_ok response")?;
-                            self.msg_id += 1;
-
-                            self.reads.remove(&msg_id);
-                        }
-                    }
-
-                    Ok(())
-                }
-                _ => Ok(()),
-            },
+            counters: message
+                .node_ids
+                .iter()
+                .map(|node_id| (node_id.clone(), 0))
+                .chain([(message.node_id.clone(), 0)])
+                .collect(),
+            last_broadcast: Instant::now(),
         }
     }
 
@@ -197,88 +74,85 @@ impl Node<MessageType> for GrowOnlyCounterNode {
     ) -> anyhow::Result<()> {
         match message.body.kind {
             MessageType::Add(body) => {
-                if body.delta == 0 {
-                    // No need to involve KV store
-                    // Effectively a no-op
-                    let reply = Response {
-                        src: self.node_id.clone(),
-                        dst: message.src,
-                        body: ResponseBody {
-                            kind: ResponseType::AddOk,
-                            msg_id: Some(self.msg_id),
-                            in_reply_to: message.body.msg_id,
-                        },
-                    };
+                *self.counters.get_mut(&self.node_id).unwrap() += body.delta;
 
-                    reply
-                        .serialize(output)
-                        .context("serializing add_ok response")?;
-                    self.msg_id += 1;
-
-                    return Ok(());
-                }
-
-                self.writes.insert(
-                    self.msg_id,
-                    WriteRequest {
-                        src: message.src,
-                        msg_id: message.body.msg_id,
-                        delta: body.delta,
+                let reply = Response {
+                    src: self.node_id.clone(),
+                    dst: message.src.clone(),
+                    body: ResponseBody {
+                        kind: ResponseType::AddOk,
+                        msg_id: Some(self.msg_id),
+                        in_reply_to: message.body.msg_id,
                     },
-                );
+                };
 
-                let mut request = self.kv.compare_and_swap::<u64>(
-                    GLOBAL_COUNTER_KEY,
-                    self.last_read,
-                    self.last_read + body.delta,
-                    self.last_read == 0,
-                );
-                request.body.msg_id = Some(self.msg_id);
-
-                request
-                    .serialize(output)
-                    .context("serializing compare_and_swap request")?;
+                reply
+                    .serialize(&mut *output)
+                    .context("serializing add_ok response")?;
 
                 self.msg_id += 1;
-
-                Ok(())
             }
             MessageType::Read => {
-                self.reads.insert(
-                    self.msg_id,
-                    ReadRequest {
-                        src: message.src,
-                        msg_id: message.body.msg_id,
-                        last_read: self.last_read,
+                let total = self.counters.values().sum::<u64>();
+
+                let reply = Response {
+                    src: self.node_id.clone(),
+                    dst: message.src.clone(),
+                    body: ResponseBody {
+                        kind: ResponseType::ReadOk(ReadOkBody { value: total }),
+                        msg_id: Some(self.msg_id),
+                        in_reply_to: message.body.msg_id,
                     },
-                );
+                };
 
-                // kv.read could return a stale value - only way to guarantee freshness is a no-op CAS
-                let mut request = self.kv.compare_and_swap::<u64>(
-                    GLOBAL_COUNTER_KEY,
-                    self.last_read,
-                    self.last_read,
-                    self.last_read == 0,
-                );
-                request.body.msg_id = Some(self.msg_id);
-
-                request
-                    .serialize(output)
-                    .context("serializing read request")?;
+                reply
+                    .serialize(&mut *output)
+                    .context("serializing read_ok response")?;
 
                 self.msg_id += 1;
-
-                Ok(())
+            }
+            MessageType::Broadcast(body) => {
+                body.values
+                    .iter()
+                    .filter(|(k, _)| **k != self.node_id)
+                    .for_each(|(node_id, incoming)| match self.counters.get_mut(node_id) {
+                        Some(current) => {
+                            if incoming > current {
+                                *current = *incoming;
+                            }
+                        }
+                        None => {
+                            self.counters.insert(node_id.clone(), *incoming);
+                        }
+                    });
             }
         }
+
+        if self.last_broadcast.elapsed() >= BROADCAST_INTERVAL {
+            self.last_broadcast = Instant::now();
+
+            for dst in self.counters.keys().filter(|k| **k != self.node_id) {
+                let message = Message {
+                    src: self.node_id.clone(),
+                    dst: dst.clone(),
+                    body: MessageBody {
+                        kind: MessageType::Broadcast(BroadcastBody {
+                            values: self.counters.clone(),
+                        }),
+                        msg_id: None,
+                    },
+                };
+
+                message
+                    .serialize(&mut *output)
+                    .context("serializing broadcast message")?;
+            }
+        }
+
+        Ok(())
     }
 }
 
 pub fn main() -> anyhow::Result<()> {
     gossip_glomers::run::<GrowOnlyCounterNode, MessageType>()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 }
