@@ -14,6 +14,7 @@ const GLOBAL_COUNTER_KEY: &str = "counter";
 struct ReadRequest {
     src: String,
     msg_id: Option<MessageID>,
+    last_read: u64,
 }
 
 #[derive(Debug)]
@@ -83,62 +84,57 @@ impl Node<MessageType> for GrowOnlyCounterNode {
             return Ok(());
         };
 
-        match body.code {
-            20 => {
-                if let Some(msg_id) = body.in_reply_to
-                    && let Some(request) = self.reads.get(&msg_id)
-                {
-                    let reply = Response {
-                        src: self.node_id.clone(),
-                        dst: request.src.clone(),
-                        body: ResponseBody {
-                            kind: ResponseType::ReadOk(ReadOkBody { value: 0 }),
-                            msg_id: Some(self.msg_id),
-                            in_reply_to: request.msg_id,
-                        },
-                    };
+        if body.code == 22
+            && let Some(msg_id) = body.in_reply_to
+        {
+            static RE: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r"current value (\d+) is not \d+").unwrap());
 
-                    reply
-                        .serialize(output)
-                        .context("serializing read_ok response")?;
-                    self.msg_id += 1;
-
-                    self.reads.remove(&msg_id);
-                }
+            if let Some(captures) = RE.captures(&body.text)
+                && let Some(last_read) = captures
+                    .get(1)
+                    .and_then(|m| str::parse::<u64>(m.as_str()).ok())
+            {
+                self.last_read = last_read
             }
-            22 => {
-                if let Some(msg_id) = body.in_reply_to
-                    && let Some(write_request) = self.writes.remove(&msg_id)
-                {
-                    static RE: LazyLock<Regex> =
-                        LazyLock::new(|| Regex::new(r"current value (\d+) is not \d+").unwrap());
 
-                    if let Some(captures) = RE.captures(&body.text)
-                        && let Some(last_read) = captures
-                            .get(1)
-                            .and_then(|m| str::parse::<u64>(m.as_str()).ok())
-                    {
-                        self.last_read = last_read
-                    }
+            if let Some(write_request) = self.writes.remove(&msg_id) {
+                let mut request = self.kv.compare_and_swap::<u64>(
+                    GLOBAL_COUNTER_KEY,
+                    self.last_read,
+                    self.last_read + write_request.delta,
+                    self.last_read == 0,
+                );
 
-                    let mut request = self.kv.compare_and_swap::<u64>(
-                        GLOBAL_COUNTER_KEY,
-                        self.last_read,
-                        self.last_read + write_request.delta,
-                        self.last_read == 0,
-                    );
-                    request.body.msg_id = Some(self.msg_id);
+                request.body.msg_id = Some(self.msg_id);
 
-                    self.writes.insert(self.msg_id, write_request);
+                self.writes.insert(self.msg_id, write_request);
 
-                    request
-                        .serialize(output)
-                        .context("serializing compare_and_swap request")?;
+                request
+                    .serialize(output)
+                    .context("serializing compare_and_swap request")?;
 
-                    self.msg_id += 1;
-                }
-            }
-            _ => {}
+                self.msg_id += 1;
+            } else if let Some(mut read_request) = self.reads.remove(&msg_id) {
+                let mut request = self.kv.compare_and_swap::<u64>(
+                    GLOBAL_COUNTER_KEY,
+                    self.last_read,
+                    self.last_read,
+                    self.last_read == 0,
+                );
+
+                request.body.msg_id = Some(self.msg_id);
+
+                read_request.last_read = self.last_read;
+
+                self.reads.insert(self.msg_id, read_request);
+
+                request
+                    .serialize(output)
+                    .context("serializing compare_and_swap request")?;
+
+                self.msg_id += 1;
+            };
         }
 
         Ok(())
@@ -147,59 +143,44 @@ impl Node<MessageType> for GrowOnlyCounterNode {
     fn on_service(&mut self, service: Service, output: &mut Output) -> anyhow::Result<()> {
         match service {
             Service::KeyValue(message) => match message.body.kind {
-                kv::ResponseType::ReadOk(kv::ReadOkBody { value }) => {
-                    let value = match value {
-                        Some(value) => serde_json::from_value::<u64>(value)
-                            .context("deserializing read_ok value as u64")?,
-                        None => 0,
-                    };
-
-                    if value >= self.last_read {
-                        self.last_read = value
-                    }
-
-                    if let Some(msg_id) = message.body.in_reply_to
-                        && let Some(request) = self.reads.get(&msg_id)
-                    {
-                        let reply = Response {
-                            src: self.node_id.clone(),
-                            dst: request.src.clone(),
-                            body: ResponseBody {
-                                kind: ResponseType::ReadOk(ReadOkBody { value }),
-                                msg_id: Some(self.msg_id),
-                                in_reply_to: request.msg_id,
-                            },
-                        };
-
-                        reply
-                            .serialize(output)
-                            .context("serializing read_ok response")?;
-                        self.msg_id += 1;
-
-                        self.reads.remove(&msg_id);
-                    }
-
-                    Ok(())
-                }
                 kv::ResponseType::CompareAndSwapOk => {
-                    if let Some(msg_id) = message.body.in_reply_to
-                        && let Some(request) = self.writes.get(&msg_id)
-                    {
-                        let reply = Response {
-                            src: self.node_id.clone(),
-                            dst: request.src.clone(),
-                            body: ResponseBody {
-                                kind: ResponseType::AddOk,
-                                msg_id: Some(self.msg_id),
-                                in_reply_to: request.msg_id,
-                            },
-                        };
-                        reply
-                            .serialize(output)
-                            .context("serializing add_ok response")?;
-                        self.msg_id += 1;
+                    if let Some(msg_id) = message.body.in_reply_to {
+                        if let Some(request) = self.writes.get(&msg_id) {
+                            let reply = Response {
+                                src: self.node_id.clone(),
+                                dst: request.src.clone(),
+                                body: ResponseBody {
+                                    kind: ResponseType::AddOk,
+                                    msg_id: Some(self.msg_id),
+                                    in_reply_to: request.msg_id,
+                                },
+                            };
+                            reply
+                                .serialize(output)
+                                .context("serializing add_ok response")?;
+                            self.msg_id += 1;
 
-                        self.writes.remove(&msg_id);
+                            self.writes.remove(&msg_id);
+                        } else if let Some(request) = self.reads.get(&msg_id) {
+                            let reply = Response {
+                                src: self.node_id.clone(),
+                                dst: request.src.clone(),
+                                body: ResponseBody {
+                                    kind: ResponseType::ReadOk(ReadOkBody {
+                                        value: request.last_read,
+                                    }),
+                                    msg_id: Some(self.msg_id),
+                                    in_reply_to: request.msg_id,
+                                },
+                            };
+
+                            reply
+                                .serialize(output)
+                                .context("serializing read_ok response")?;
+                            self.msg_id += 1;
+
+                            self.reads.remove(&msg_id);
+                        }
                     }
 
                     Ok(())
@@ -268,9 +249,11 @@ impl Node<MessageType> for GrowOnlyCounterNode {
                     ReadRequest {
                         src: message.src,
                         msg_id: message.body.msg_id,
+                        last_read: self.last_read,
                     },
                 );
 
+                // kv.read could return a stale value - only way to guarantee freshness is a no-op CAS
                 let mut request = self.kv.compare_and_swap::<u64>(
                     GLOBAL_COUNTER_KEY,
                     self.last_read,
