@@ -63,7 +63,7 @@ impl Node<MessageType> for BroadcastNode {
         }
     }
 
-    fn handle(&mut self, message: Message<MessageType>, output: &mut Output) -> anyhow::Result<()> {
+    fn on_message(&mut self, message: Message<MessageType>, output: &mut Output) -> anyhow::Result<()> {
         match message.body.kind {
             MessageType::Broadcast(body) => {
                 if !self.messages.insert(body.message) {

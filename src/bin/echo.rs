@@ -45,7 +45,7 @@ impl Node<MessageType> for EchoNode {
         }
     }
 
-    fn handle(&mut self, message: Message<MessageType>, output: &mut Output) -> anyhow::Result<()> {
+    fn on_message(&mut self, message: Message<MessageType>, output: &mut Output) -> anyhow::Result<()> {
         match message.body.kind {
             MessageType::Echo(body) => {
                 let reply = Response {

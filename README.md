@@ -21,3 +21,9 @@ java -jar maelstrom.jar test -w unique-ids --bin target/debug/unique-ids --time-
 ```sh
 java -jar maelstrom.jar test -w broadcast --bin target/debug/broadcast --node-count 5 --time-limit 20 --rate 10
 ```
+
+## Grow only counter
+
+```sh
+java -jar maelstrom.jar test -w g-counter --bin target/debug/g-counter --node-count 3 --rate 100 --time-limit 20 --nemesis partition
+```

@@ -4,6 +4,8 @@ use std::io::{self, BufRead, StdoutLock, Write};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+pub mod kv;
+
 pub type MessageID = u64;
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
@@ -54,7 +56,7 @@ enum ResponseType {
     InitOk,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct ResponseBody<Type> {
     #[serde(rename = "type", flatten)]
     pub kind: Type,
@@ -72,7 +74,7 @@ pub struct ResponseBody<Type> {
 //     "echo": "Please echo 35"
 //   }
 // }
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct Response<Type> {
     pub src: String,
     #[serde(rename = "dest")]
@@ -102,11 +104,46 @@ impl Formatter for JSONLFormatter {
     }
 }
 
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+pub struct ErrorBody {
+    pub code: u32,
+    pub text: String,
+    pub in_reply_to: Option<MessageID>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ErrorMessageType {
+    Error(ErrorBody),
+}
+
+#[derive(Debug)]
+pub enum Service {
+    KeyValue(Response<kv::ResponseType>),
+}
+
 pub type Output<'a> = Serializer<StdoutLock<'a>, JSONLFormatter>;
 
 pub trait Node<MessageType> {
     fn init(message: InitBody) -> Self;
-    fn handle(&mut self, message: Message<MessageType>, output: &mut Output) -> anyhow::Result<()>;
+
+    fn on_message(
+        &mut self,
+        message: Message<MessageType>,
+        output: &mut Output,
+    ) -> anyhow::Result<()>;
+
+    fn on_service(&mut self, _service: Service, _output: &mut Output) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn on_error(
+        &mut self,
+        _error: Message<ErrorMessageType>,
+        _output: &mut Output,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 pub fn run<N, Type>() -> anyhow::Result<()>
@@ -142,10 +179,32 @@ where
 
     let mut node: N = Node::init(init_body);
 
-    for message in serde_json::Deserializer::from_reader(input).into_iter::<Message<Type>>() {
-        let message = message.context("could not deserialize Maelstrom input")?;
+    for line in input.lines() {
+        let line = line.context("reading from stdin")?;
+        let raw: serde_json::Value =
+            serde_json::from_str(&line).context("could not deserialize Maelstrom input as JSON")?;
 
-        node.handle(message, &mut output)?;
+        if let Some(message) = raw.as_object() {
+            let src = message["src"].as_str().unwrap_or("");
+            let msg_type = message["body"]["type"].as_str().unwrap_or("");
+
+            match msg_type {
+                "error" => {
+                    let msg: Message<ErrorMessageType> = serde_json::from_value(raw)?;
+                    node.on_error(msg, &mut output)?;
+                }
+                "read_ok" | "write_ok" | "cas_ok" if src == "seq-kv" => {
+                    let msg: Response<kv::ResponseType> = serde_json::from_value(raw)?;
+                    node.on_service(Service::KeyValue(msg), &mut output)?;
+                }
+                _ => {
+                    let msg: Message<Type> = serde_json::from_value(raw)?;
+                    node.on_message(msg, &mut output)?;
+                }
+            }
+        } else {
+            anyhow::bail!("malformed message {}", raw)
+        }
     }
 
     Ok(())
